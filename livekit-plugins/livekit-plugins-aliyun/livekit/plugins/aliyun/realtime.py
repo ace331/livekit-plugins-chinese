@@ -8,6 +8,7 @@ import json
 import os
 import time
 import weakref
+from collections import deque
 from collections.abc import AsyncIterable, Iterator
 from dataclasses import dataclass, replace
 from typing import Any, Literal, NewType
@@ -39,6 +40,17 @@ NUM_CHANNELS: Literal[1] = 1
 DEFAULT_BASE_URL: str = "wss://dashscope.aliyuncs.com/api-ws/v1/realtime"
 DEFAULT_MAX_SESSION_DURATION: int = 20 * 60
 _RESPONSE_CREATE_TIMEOUT: float = 10.0
+# Qwen rejects every input_audio_buffer.append once the uncommitted buffer
+# passes 30 s in manual turn-handling mode, silently discarding the user's
+# speech until the next commit. Clear the buffer well before that cap: after
+# a quiet tail once the soft limit accumulates, and unconditionally at the
+# hard limit so a mid-speech turn can still be committed cleanly.
+_MANUAL_BUFFER_SOFT_SECONDS: float = 20.0
+_MANUAL_BUFFER_HARD_SECONDS: float = 28.0
+_MANUAL_QUIET_RMS: int = 300
+"""Chunk RMS below this value counts as silence (16-bit PCM, ≈ -40 dBFS)."""
+_MANUAL_RMS_WINDOW: int = 10
+"""Chunks (~100 ms each) inspected for the quiet-tail check."""
 
 RealtimeModelName = Literal[
     "qwen-audio-3.1-realtime-plus",
@@ -268,6 +280,19 @@ def _api_error_log_fields(error: APIError) -> dict[str, Any]:
         if str(cause):
             fields["cause_message"] = str(cause)
     return fields
+
+
+def _chunk_rms(data: bytes) -> int:
+    """Return the RMS of interleaved int16 samples (mono PCM16 expected)."""
+    count = len(data) // 2
+    if count == 0:
+        return 0
+    samples = memoryview(data).cast("h")
+    total = 0
+    for i in range(count):
+        value = samples[i]
+        total += value * value
+    return int((total / count) ** 0.5)
 
 
 @dataclass
@@ -690,6 +715,10 @@ class RealtimeSession(
         """Whether Qwen has reported an active acoustic speech segment."""
         self._turn_active: bool = False
         """Whether Smart Turn/server VAD still owns the current user turn."""
+        self._manual_buffer_seconds: float = 0.0
+        """Audio appended since the last commit/clear, for the manual-mode guard."""
+        self._manual_rms_window: deque[int] = deque(maxlen=_MANUAL_RMS_WINDOW)
+        """RMS of the most recent ~1 s of chunks, used for the quiet-tail check."""
         self._server_session_created = asyncio.Event()
         """Set after Qwen confirms that the WebSocket session exists."""
         self._server_session_updated = asyncio.Event()
@@ -914,6 +943,46 @@ class RealtimeSession(
                         "audio": base64.b64encode(chunk.data).decode("ascii"),
                     }
                 )
+                self._guard_manual_buffer(chunk)
+
+    def _guard_manual_buffer(self, chunk: rtc.AudioFrame) -> None:
+        """Keep the manual-mode input buffer below Qwen's 30 s cap.
+
+        With manual turn handling Qwen never commits on its own, yet it
+        rejects every ``input_audio_buffer.append`` once the uncommitted
+        buffer exceeds 30 s — discarding whatever the user says until the
+        next commit. Clear the buffer proactively: after a quiet tail once
+        the soft limit has accumulated, and unconditionally before the hard
+        limit so a long utterance can still be committed cleanly.
+
+        Args:
+            chunk (rtc.AudioFrame): The ~100 ms chunk that was just appended.
+        """
+        if self._opts.turn_detection is not None:
+            # Server-managed turn detection segments the buffer itself; the
+            # 30 s cap has not been observed in that mode.
+            return
+        self._manual_buffer_seconds += chunk.samples_per_channel / chunk.sample_rate
+        self._manual_rms_window.append(_chunk_rms(chunk.data))
+        if self._manual_buffer_seconds < _MANUAL_BUFFER_SOFT_SECONDS:
+            return
+        quiet = max(self._manual_rms_window, default=0) < _MANUAL_QUIET_RMS
+        if not quiet and self._manual_buffer_seconds < _MANUAL_BUFFER_HARD_SECONDS:
+            return
+        logger.info(
+            "clearing idle manual-mode input buffer before Qwen's 30s cap",
+            extra={
+                "buffer_seconds": round(self._manual_buffer_seconds, 1),
+                "quiet_tail": quiet,
+            },
+        )
+        self._reset_manual_buffer()
+        self.send_event({"type": "input_audio_buffer.clear"})
+
+    def _reset_manual_buffer(self) -> None:
+        """Forget the accumulated manual-mode buffer bookkeeping."""
+        self._manual_buffer_seconds = 0.0
+        self._manual_rms_window.clear()
 
     def push_video(self, frame: rtc.VideoFrame) -> None:
         """Reject video input with a warning.
@@ -938,6 +1007,7 @@ class RealtimeSession(
                 }
             )
         self.send_event({"type": "input_audio_buffer.commit"})
+        self._reset_manual_buffer()
 
     def clear_audio(self) -> None:
         """Discard locally and remotely buffered, uncommitted manual-mode audio."""
@@ -947,6 +1017,7 @@ class RealtimeSession(
             samples_per_channel=INPUT_SAMPLE_RATE // 10,
         )
         self.send_event({"type": "input_audio_buffer.clear"})
+        self._reset_manual_buffer()
 
     def _refresh_response_create_ready(self) -> None:
         """Update the response.create gate from Qwen's server-side turn state."""
@@ -1618,6 +1689,10 @@ class RealtimeSession(
                     user_transcription_enabled=not is_invalid_smart_turn
                 ),
             )
+        elif event_type == "input_audio_buffer.committed":
+            # Covers server-initiated commits too (server_vad mode); the
+            # committed buffer restarts from scratch on the provider side.
+            self._reset_manual_buffer()
         elif event_type == "conversation.item.input_audio_transcription.completed":
             self._handle_input_transcription(event)
         elif event_type == "response.created":
