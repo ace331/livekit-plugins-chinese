@@ -282,12 +282,14 @@ def _api_error_log_fields(error: APIError) -> dict[str, Any]:
     return fields
 
 
-def _chunk_rms(data: bytes) -> int:
+def _chunk_rms(data: bytes | memoryview) -> int:
     """Return the RMS of interleaved int16 samples (mono PCM16 expected)."""
+    # AudioFrame.data is a typed memoryview that refuses cast("h"); normalize
+    # through bytes first. Chunks are ~3 KB, ten times per second.
     count = len(data) // 2
     if count == 0:
         return 0
-    samples = memoryview(data).cast("h")
+    samples = memoryview(bytes(data)).cast("h")
     total = 0
     for i in range(count):
         value = samples[i]
