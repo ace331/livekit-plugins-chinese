@@ -339,6 +339,8 @@ class _MessageGeneration:
     """Resolved after Qwen declares the response content type."""
     audio_transcript: str = ""
     """Accumulated assistant transcript used to update chat history."""
+    audio_chunks: int = 0
+    """Number of audio deltas received, to detect silent empty responses."""
 
     def close(self, fallback_modalities: Modalities) -> None:
         """Resolve pending modality metadata and close both output streams."""
@@ -1831,6 +1833,7 @@ class RealtimeSession(
             if self._current_generation.first_token_timestamp is None:
                 self._current_generation.first_token_timestamp = time.time()
         audio = base64.b64decode(delta)
+        message.audio_chunks += 1
         message.audio_ch.send_nowait(
             rtc.AudioFrame(
                 data=audio,
@@ -1956,6 +1959,18 @@ class RealtimeSession(
         self._current_generation = None
         if not self._input_speaking:
             self._turn_active = False
+        if (
+            not generation.messages
+            or all(
+                not msg.audio_transcript and msg.audio_chunks == 0
+                for msg in generation.messages.values()
+            )
+        ) and not getattr(generation, "emitted_call_ids", None):
+            logger.warning(
+                "Qwen realtime response finished with no output (no transcript, "
+                "audio, or function calls); the turn will be silent",
+                extra={"response_id": response_id},
+            )
         self._refresh_response_create_ready()
         self.emit(
             "metrics_collected",
